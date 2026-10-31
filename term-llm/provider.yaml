@@ -1,0 +1,13 @@
+# Merge this entry into providers only AFTER endpoint smoke verification.
+# Do not change default_provider or Jarvis agent defaults.
+providers:
+  flashnext:
+    type: openai_compatible
+    base_url: http://<appliance>:18098/v1
+    model: flashnext
+    context_window: 65536
+    max_output_tokens: 4096
+    models:
+      - id: flashnext
+        reasoning_efforts: [none, low, medium, xhigh]
+        default_reasoning_effort: none
