@@ -20,6 +20,15 @@ engine as its own child, times it until `/health` reports `loaded: true`, runs t
 trials and stops only that child. Results append to
 `$STRATA_ROOT/results/benchmark-<time>.jsonl`.
 
+[`decode_by_content.py`](decode_by_content.py) measures decode through a running
+gateway for different kinds of output (code, JSON, a tool call, prose, Hebrew,
+reasoning, long context), because speculative decoding makes the rate depend on
+how predictable the output is:
+
+```sh
+python3 bench/decode_by_content.py http://localhost:18098 > decode.jsonl
+```
+
 [`bench_driver.py`](bench_driver.py) produced run B on a machine where the
 gateway could not be stopped: it waits for the gateway's engine
 to idle out on its own, runs the cold ladder above, then adds probes through the
@@ -52,8 +61,10 @@ numbers off as cold.
   which is why a fresh engine took 16.0 s in one run and 26.5 s in the other.
 - **Small prompts look slow** because each request pays ~1.8 s of fixed
   first-token cost. Always quote prompt size next to a prefill rate.
-- **Synthetic text drafts well.** MTP acceptance on it is 63–77%; natural prompts
-  decode at ~160–185 tok/s rather than the synthetic ~170–180.
+- **Decode depends on the output.** The synthetic ladder decodes at ~170–180
+  tok/s. Real output ranges from ~215 (JSON) through ~180–200 (code, tool calls)
+  to ~145 (English prose) and ~105 (Hebrew), following draft acceptance; real
+  mixed use averaged 156 tok/s.
 - `prompt_tokens_over_ttft_estimate` and `client_decode_tok_s_estimate` in the
   JSONL are client-side estimates (SSE chunks are not tokens); the engine's own
   timings are authoritative.
@@ -69,6 +80,7 @@ numbers off as cold.
 |---|---|---|
 | `results/run-A-20261031T1306Z.jsonl` | 2026-10-31 13:06 | `benchmark.py --measure-load`; engine log in `run-A-cold-load-…log` |
 | `results/run-B-20261031T1941Z.jsonl` | 2026-10-31 19:41 | `bench_driver.py`: cold ladder plus gateway probes |
+| `results/decode-by-content-20261101.jsonl` | 2026-11-01 | `decode_by_content.py` through the gateway, warm engine |
 | `legacy-llamacpp/results.jsonl` | 2026-10-31 | the llama.cpp backend, method in `legacy-llamacpp/bench.py` |
 
 The CPU-only tests run with `cd bench && python3 -m unittest test_benchmark`.

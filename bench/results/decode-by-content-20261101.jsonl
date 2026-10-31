@@ -1,0 +1,7 @@
+{"case": "code (python module)", "tokens": 1200, "finish": "length", "prompt_tokens": 44, "engine_tok_s": 200.5, "client_tok_s": 200.7, "draft_accept": "812/1054", "wall_s": 6.5}
+{"case": "prose (essay)", "tokens": 1200, "finish": "length", "prompt_tokens": 36, "engine_tok_s": 144.4, "client_tok_s": 144.5, "draft_accept": "618/1131", "wall_s": 8.6}
+{"case": "tool call (write_file, Go server)", "tokens": 1200, "finish": "length", "prompt_tokens": 302, "engine_tok_s": 183.2, "client_tok_s": 183.5, "draft_accept": "837/1011", "wall_s": 7.3}
+{"case": "JSON data", "tokens": 1200, "finish": "length", "prompt_tokens": 47, "engine_tok_s": 214.7, "client_tok_s": 215.0, "draft_accept": "856/958", "wall_s": 5.9}
+{"case": "Hebrew prose", "tokens": 1200, "finish": "length", "prompt_tokens": 37, "engine_tok_s": 105.3, "client_tok_s": 105.3, "draft_accept": "149/504", "wall_s": 11.6}
+{"case": "reasoning (xhigh, thinking on)", "tokens": 1200, "finish": "length", "prompt_tokens": 92, "engine_tok_s": 179.0, "client_tok_s": 179.5, "draft_accept": "760/990", "wall_s": 7.1}
+{"case": "code with ~68K tokens of context", "tokens": 1200, "finish": "length", "prompt_tokens": 68115, "engine_tok_s": 179.5, "client_tok_s": 179.7, "draft_accept": "804/1020", "wall_s": 6.8}

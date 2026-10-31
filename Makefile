@@ -12,7 +12,7 @@ check:
 	sh -n $(SH_SCRIPTS)
 	bash -n $(BASH_SCRIPTS)
 	$(PYTHON) -c 'import ast, sys; [ast.parse(open(f).read(), f) for f in sys.argv[1:]]' \
-		strata/download_models.py flashnext/smoke.py bench/bench_driver.py bench/legacy-llamacpp/bench.py
+		strata/download_models.py flashnext/smoke.py bench/bench_driver.py bench/decode_by_content.py bench/legacy-llamacpp/bench.py
 	$(PYTHON) -c 'import json, sys; [json.load(open(f)) for f in sys.argv[1:]]' \
 		strata/*.json.tmpl provenance/*.json
 	@if command -v shellcheck >/dev/null; then \

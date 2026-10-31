@@ -3,8 +3,8 @@
 [![CI](https://github.com/sam-saffron-jarvis/flashnext-recipe/actions/workflows/ci.yml/badge.svg)](https://github.com/sam-saffron-jarvis/flashnext-recipe/actions/workflows/ci.yml)
 
 Serving [Qwen3.8-Flash-Next](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-on a single 24 GB RTX 4090 with 128K context, at ~2,800 tok/s prefill and
-~170 tok/s decode. The model is ISTA-DASLab's IQ3_XXS quantisation, run by
+on a single 24 GB RTX 4090 with 128K context, at ~2,700–2,900 tok/s prefill and
+140–215 tok/s decode depending on what it writes. The model is ISTA-DASLab's IQ3_XXS quantisation, run by
 [Strata](https://github.com/Niko1221/Strata) with the experts in system RAM,
 behind a small gateway that loads it on demand, queues requests, unloads it when
 idle and can hand the GPU to Ollama and back.
@@ -31,15 +31,27 @@ and caveats: [bench/README.md](bench/README.md).
 The second run's medians (782 / 2,721 / 2,747 / 2,852 / 2,757) agree within 3%.
 Every request pays ~1.8 s of fixed first-token cost, which dominates below ~8K tokens.
 
-| Decode, 1,000 tokens | tok/s |
-|---|---|
-| synthetic prompt, ~2K context | 168 (run B), 178 (run A) |
-| synthetic prompt, ~32K context | 180 (run B), 177 (run A) |
-| natural code / prose prompt | 186 / 158 |
+Decode speed depends on what the model is writing. About half of it comes from
+speculative decoding: a small draft head guesses several tokens ahead and the
+full model checks them in one pass, so predictable output goes faster. 1,200
+tokens per case, engine and client measurements within 1% of each other
+([`bench/decode_by_content.py`](bench/decode_by_content.py)):
 
-Synthetic text is easy for the MTP drafter (63–77% of drafts accepted), so expect
-~160–185 tok/s on real work. A fresh engine is ready in 16–27 s; a request to an
-unloaded gateway gets its first token in ~15 s.
+| Output | Decode tok/s | Drafts accepted |
+|---|---|---|
+| JSON data | 215 | 89% |
+| Python code | 200 | 77% |
+| tool call writing a Go file | 183 | 83% |
+| code, with 68K tokens of context | 180 | 79% |
+| reasoning at xhigh effort | 179 | 77% |
+| English prose | 144 | 55% |
+| Hebrew prose | 105 | 30% |
+
+Across 84K tokens of real use (an agent session plus chat), Strata's own
+per-request log averaged **156 tok/s**; 80% of requests of 200+ tokens fell
+between 135 and 174. Context length barely matters, and the first request after
+a load runs a little slower while the expert cache warms. A fresh engine is
+ready in 16–27 s; a request to an unloaded gateway gets its first token in ~15 s.
 
 Under agent load:
 
