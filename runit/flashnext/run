@@ -1,0 +1,28 @@
+#!/bin/sh
+# runit service for the FlashNext gateway (port 18098). Override any of these in
+# the service environment (for example with chpst -e envdir) instead of editing.
+set -eu
+exec 2>&1
+APP_DIR=${FLASHNEXT_APP_DIR:-/opt/flashnext-app}       # contains the flashnext/ package
+PYTHON=${FLASHNEXT_PYTHON:-/opt/flashnext-venv/bin/python}   # Python 3.11+ with aiohttp>=3.10
+RUN_AS=${FLASHNEXT_USER:-flashnext}                     # owns the runtime root
+BACKEND=${FLASHNEXT_BACKEND:-strata}                    # strata, or llamacpp (legacy)
+case "$BACKEND" in
+    strata)
+        ROOT=${STRATA_ROOT:-/srv/strata-runtime}
+        READY="$ROOT/downloads/prepared-artifacts.json" ;;
+    llamacpp)
+        ROOT=${LLAMACPP_ROOT:-/srv/flashnext-llamacpp}
+        READY="$ROOT/runtime/llama.cpp/build/bin/llama-server" ;;
+    *)
+        echo "flashnext: unknown FLASHNEXT_BACKEND=$BACKEND"; exec sleep 60 ;;
+esac
+# Stay down, loading nothing, until the runtime has been installed.
+if [ ! -e "$READY" ]; then
+    echo "flashnext: $BACKEND runtime not provisioned ($READY missing); waiting"
+    exec sleep 60
+fi
+cd "$APP_DIR"
+exec chpst -u "$RUN_AS" "$PYTHON" -m flashnext.server \
+    --backend "$BACKEND" --root "$ROOT" --host 0.0.0.0 \
+    --idle "${FLASHNEXT_IDLE_SECONDS:-600}"

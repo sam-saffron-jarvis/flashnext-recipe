@@ -44,7 +44,7 @@
     "--mtp",
     "__RUNTIME_ROOT__/models/mtp/rt",
     "--max-context",
-    "65536",
+    "131072",
     "--kv",
     "int8",
     "--kv-resident",
@@ -54,7 +54,13 @@
     "--prompt-cache",
     "1",
     "--conversation-cache-mib",
-    "0"
+    "4096",
+    "--conversation-cache-slots",
+    "3",
+    "--conversation-cache-min-free-mib",
+    "4096",
+    "--conversation-cache-min-tokens",
+    "2048"
   ],
   "drafting": "mtp"
 }

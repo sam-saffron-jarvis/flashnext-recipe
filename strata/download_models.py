@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Sequential pinned GGUF acquisition; one curl transfer at a time, SHA256 verified."""
+"""Sequential pinned GGUF acquisition; one transfer at a time, SHA256 verified.
+
+Usage: download_models.py STRATA_ROOT  (expects downloads/hf-ista-metadata.json there;
+install.sh fetches it). Already-complete files are only re-verified.
+"""
 import hashlib, json, pathlib, sys, os
-root = pathlib.Path(__file__).resolve().parent
+if len(sys.argv) != 2:
+    sys.exit("usage: download_models.py STRATA_ROOT")
+root = pathlib.Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(root/'control'))
 os.environ['STRATA_DL_CONNECTIONS']='4'
 import setup as strata_setup

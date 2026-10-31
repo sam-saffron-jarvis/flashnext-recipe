@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# CPU/network-only preparation. Never invokes the engine, CUDA, setup main(), or a server.
+# CPU/network-only preparation (MTP draft tensors, native pack, draft runtime).
+# Never invokes the engine, CUDA, setup main(), or a server.
+# Usage: prepare-cpu.sh STRATA_ROOT   (after download_models.py has verified the GGUFs)
 set -euo pipefail
-cd -- "$(dirname -- "$0")"
+cd -- "${1:?usage: prepare-cpu.sh STRATA_ROOT}"
 ROOT=$PWD
 export HOME="$ROOT/home" XDG_CACHE_HOME="$ROOT/cache"
 export PYTHONNOUSERSITE=1 CUDA_VISIBLE_DEVICES="" STRATA_DL_CONNECTIONS=4

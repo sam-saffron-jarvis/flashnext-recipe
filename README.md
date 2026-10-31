@@ -1,353 +1,215 @@
-# FlashNext on one RTX 4090 — the recipe I actually run
+# FlashNext on one RTX 4090
 
-**What this is:** serving [Qwen3.8-Flash-Next](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
-(a ~80B-parameter MoE, 512 routed experts per layer across 48 layers, 10 active per token)
-on a **single 24 GB RTX 4090**, quantised by ETH Zurich's IST-DASLab to **IQ3_XXS** with
-GSQ + RCO, run by [Strata](https://github.com/Niko1221/Strata) (MIT) with experts streamed
-from system RAM/SSD, behind a small lazy-loading OpenAI-compatible gateway that unloads the
-engine when nobody is using it.
+[![CI](https://github.com/sam-saffron-jarvis/flashnext-recipe/actions/workflows/ci.yml/badge.svg)](https://github.com/sam-saffron-jarvis/flashnext-recipe/actions/workflows/ci.yml)
 
-Every number below is mine, measured on the appliance that runs this stack, on 2026-11-01
-(two independent 3-round cold runs, ~6.5 h apart). Raw evidence is in `bench/`.
+Serving [Qwen3.8-Flash-Next](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+on a single 24 GB RTX 4090 with 128K context, at ~2,800 tok/s prefill and
+~170 tok/s decode. The model is ISTA-DASLab's IQ3_XXS quantisation, run by
+[Strata](https://github.com/Niko1221/Strata) with the experts in system RAM,
+behind a small gateway that loads it on demand, queues requests, unloads it when
+idle and can hand the GPU to Ollama and back.
 
-## The numbers
+This is the code and configuration of a running deployment that serves as a
+coding-agent backend, with its raw benchmark data.
 
-### Prefill (prompt processing), fresh engine process, `--max-context 131072`
+## Numbers
 
-Synthetic salted prompts, `max_tokens: 1`, greedy, thinking off. Rates are Strata's own
-engine clock (`timings.prompt_per_second`), not a client estimate. 3 rounds; median and range shown.
+Measured 2026-10-31 on this hardware. Two independent three-round runs from a
+fresh engine process; rates are Strata's own engine timings, thinking off. Method
+and caveats: [bench/README.md](bench/README.md).
 
-| actual prompt tokens | median prefill tok/s | min–max | median time to first token |
-|---|---|---|---|
-| 1,960 – 1,965 | **789** | 766 – 789 | 2.49 s |
-| 7,681 – 8,163 | **2,739** | 2,670 – 2,808 | 2.89 s |
-| 15,998 – 16,482 | **2,823** | 2,700 – 2,827 | 5.67 s |
-| 31,190 – 32,158 | **2,857** | 2,782 – 2,866 | 11.22 s |
-| 54,294 – 54,298 | **2,763** | 2,757 – 2,763 | 19.65 s |
-
-The second run (different process, ~6.5 h earlier) gives medians **782 / 2,721 / 2,747 /
-2,852 / 2,757** for the same ladder — the two runs agree within ~4 %.
-
-At small prompts the per-token rate collapses because there is roughly **1.8 s of fixed
-first-token cost** per request (derived: 2,491 ms at 1,960 tokens vs the ~0.36 ms/token the
-same engine sustains at 32k). Quoting "prefill tok/s" without saying which prompt size is
-meaningless, so both are given here.
-
-### Decode (generation), 1,000 requested tokens, thinking off
-
-| prompt context | run | median decode tok/s | min–max | MTP drafts accepted |
-|---|---|---|---|---|
-| ~2.0k | B | **168** | 165 – 177 | 569 – 610 of 850 – 882 |
-| ~32.2k | B | **180** | 169 – 184 | 592 – 631 of 819 – 861 |
-| ~2.0k | A | **178** | 154 – 179 | 561 – 610 of 862 – 886 |
-| ~31.2 – 32.2k | A | **177** | 170 – 180 | 592 – 624 of 837 – 863 |
-
-So: **~2.7–2.9k tok/s prefill, ~170 tok/s decode**, with draft acceptance of 63–77 %
-(usually ~70 %). Decode is *faster* at 32k context than at 2k, which is what a MoE with
-streamed experts looks like: the bottleneck is expert I/O and drafting, not attention.
-
-### Full 128K window, through the gateway (warm engine)
-
-| prompt tokens | prefill tok/s | time to first token |
+| Prompt tokens | Prefill tok/s, median (range) | First token |
 |---|---|---|
-| 102,373 | 2,745 | 37.35 s |
-| 125,359 (95.6 % of the 131,072 window) | 2,714 | 46.24 s |
+| ~2,000 | 789 (766–789) | 2.5 s |
+| ~8,000 | 2,739 (2,670–2,808) | 2.9 s |
+| ~16,000 | 2,823 (2,700–2,827) | 5.7 s |
+| ~32,000 | 2,857 (2,782–2,866) | 11.3 s |
+| ~54,000 | 2,763 (2,757–2,763) | 19.7 s |
+| 102,373 (through the gateway) | 2,745 | 37.4 s |
+| 125,359 (through the gateway) | 2,714 | 46.2 s |
 
-Prefill does not fall off at the top of the window — `--kv int8` plus KV streaming
-(`--kv-resident 32768`) is what makes 128K affordable on 24 GB at all.
+The second run's medians (782 / 2,721 / 2,747 / 2,852 / 2,757) agree within 3%.
+Every request pays ~1.8 s of fixed first-token cost, which dominates below ~8K tokens.
 
-### Cold start, and what the gateway costs
-
-| measurement | seconds |
+| Decode, 1,000 tokens | tok/s |
 |---|---|
-| fresh engine process → `/health` `loaded:true` (run B, page cache warm from a just-exited engine) | **16.0** |
-| fresh engine process → `/health` `loaded:true` (run A, ~6.5 h after the previous engine) | **26.5** |
-| gateway cold probe: POST to an unloaded gateway, 17-token prompt, first token | **15.2** |
-| same probe, completion of 2 tokens | 15.3 |
+| synthetic prompt, ~2K context | 168 (run B), 178 (run A) |
+| synthetic prompt, ~32K context | 180 (run B), 177 (run A) |
+| natural code / prose prompt | 186 / 158 |
 
-Gateway overhead is essentially zero: the same 32,188-token / 1,000-token request measured
-11.39 s client-side to first token vs 11.36 s engine-side `prompt_ms`, 174.0 tok/s engine
-decode vs 174.3 tok/s client estimate, 17.12 s wall vs 17.10 s in the engine's own timings.
+Synthetic text is easy for the MTP drafter (63–77% of drafts accepted), so expect
+~160–185 tok/s on real work. A fresh engine is ready in 16–27 s; a request to an
+unloaded gateway gets its first token in ~15 s.
 
-For comparison, the previous llama.cpp-based setup on this same card managed ~300 tok/s
-prefill and ~29 tok/s decode. Same GPU, same model family, different runtime and
-quantisation — see [docs/legacy-llamacpp.md](docs/legacy-llamacpp.md).
+Under agent load:
 
-## Hardware and why it fits
+| | Result |
+|---|---|
+| short side request between turns of a 78K-token conversation | next turn 0.28 s with the conversation cache, 28.4 s without |
+| request arriving while another generates | waits its turn (was an instant 429) |
+| Ollama `qwen3.8:27b` request while FlashNext is loaded | FlashNext unloads, Ollama loads fully on the GPU, first reply 7.9–8.8 s |
+
+For comparison, llama.cpp with Unsloth's UD-IQ4_XS on the same card managed ~300
+tok/s prefill and ~29 tok/s decode at 64K context
+([docs/legacy-llamacpp.md](docs/legacy-llamacpp.md)). Different quantisation, so
+that is a speed comparison, not a quality one.
+
+## How it fits in 24 GB
 
 | | |
 |---|---|
-| GPU | NVIDIA GeForce RTX 4090, 24 564 MiB |
-| Driver | 615.78.08 (Strata's engine requires ≥ 580.65) |
-| CPU | Intel i9-14900K (24 cores / 32 threads) |
-| RAM | 62 GB + 63 GB swap |
-| Model storage | NVMe, ext4 |
-| Weight files | 75 839 998 528 B (75.84 GB / 70.63 GiB) across 2 shards |
-| VRAM in use while loaded | ~23.3 GB measured (`nvidia-smi`), with `--vram-reserve-mib 1024` |
+| GPU | RTX 4090 24 GB; NVIDIA driver ≥ 580.65 (tested 615.78) |
+| CPU / RAM | i9-14900K, 62 GB RAM |
+| Disk | NVMe, ~87 GB for the runtime and weights |
+| While loaded | 23.4 GB VRAM (including ~1.2 GB for the host display), ~10 GB RAM free |
 
-The trick is that only the dense part, attention, drafting and a slice of KV are pinned to
-the GPU. The 512-expert-per-layer MoE is served from host memory with an adaptive resident
-expert cache, and the second shard — a **28.8 GB PLE / n-gram lookup table** — is read
-straight off SSD with `--ple-io direct` instead of being resident anywhere. Engine log
-excerpt from production traffic:
+Flash-Next is a sparse mixture of experts: 48 layers of 512 routed experts, 10
+active per token. Strata keeps the dense weights, attention, the MTP draft head
+and the most recent 32K tokens of int8 KV on the GPU. The experts sit in RAM with
+a learned cache of the busy ones in VRAM, and the 28.8 GB per-layer n-gram lookup
+table (shard 2) is read straight from the SSD.
 
-```
-strata serve: asynchronous adaptive tier: 183 rounds, 10983 experts swapped in, 16.6 ms per round
-cache hit rate: 95.0% (1791867 hits / 1885487 lookups); 2476 more read by the GPU over PCIe ...
-```
+## Install
 
-95 % expert-cache hits and ~10k expert swaps per generation window is where the ~170 tok/s
-comes from.
+Everything runs as one unprivileged user (here `flashnext`).
 
-## Pinned provenance
-
-Model — `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, revision
-`ed59f92082b1e93c0e96d60a8b11aab089b52f09`, Apache-2.0 (see `docs/model-card.ISTA-DASLab.md`):
-
-| file | bytes | SHA-256 |
-|---|---|---|
-| `IQ3_XXS/…-00001-of-00002.gguf` | 47 039 860 096 | `219ea929900dfa9ef091f3aa473fdba6874b65fcb36526d7d851ac9e95856d15` |
-| `IQ3_XXS/…-00002-of-00002.gguf` | 28 800 138 432 | `316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113` |
-
-Draft head — `Qwen/Qwen3.8-Flash-Next`, revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`,
-quantised locally to Q2_0 (889 017 216 B, `a22206a4d74eafbf31063a84610292535fb3b49af9a339963817fd04aed81e4d`).
-
-Runtime — Strata upstream release **v0.2.9**, Control **0.1.55** (`c62d5e3a15b40ea51c96aae9e8d36928965f53ab`),
-engine **0.1.55-linux-x86_64-cuda-cuda13**, build id `99866a47a2b8+cuda13.0`, archs
-`sm_75/86/89/120` (4090 = sm_89). The engine binary and its bundled `libcudart/libcublas/
-libcublasLt` are hashed in `runtime/provenance/engine-component.json`; the CUDA 13 libraries
-ship inside the component, so no CUDA toolkit, nvcc, Docker or pip wheels are needed.
-Hashes of the recipe scripts themselves are in `runtime/downloads/runtime-files-sha256.txt`.
-
-## Setup
-
-1. Install Strata v0.2.9 into your runtime root (upstream installer), then copy these files
-   into it: `env.sh`, `launch.sh`, `bin/strata`, `download_models.py`, `prepare-cpu.sh`,
-   `verify-cpu.py`, `benchmark.py`, `test_benchmark.py`, and the two config templates.
-
-2. `env.sh` keeps all state under the runtime root and forbids surprise downloads:
+1. **Runtime.** On an NVMe disk with ~90 GB free:
 
    ```sh
-   export STRATA_ROOT=/path/to/strata-runtime          # edit in env.sh or export before sourcing
-   export STRATA_COMPONENTS_DIR=$STRATA_ROOT/components STRATA_DATA_DIR=$STRATA_ROOT/data
-   export STRATA_INSTALL_DIR=$STRATA_ROOT STRATA_ENGINE_BACKEND=cuda
-   export STRATA_NO_ACQUIRE=1 HF_HUB_OFFLINE=1
+   strata/install.sh /srv/strata-runtime
    ```
 
-3. Download the pinned shards (sequential, one transfer at a time, SHA-256 verified against
-   the pinned HF metadata in `runtime/downloads/hf-ista-metadata.json`):
+   It downloads the pinned Strata v0.2.9 release and the IQ3_XXS weights,
+   verifying every file against a pinned SHA-256, runs Strata's CPU-only
+   preparation (MTP draft head, native pack), installs `launch.sh` and `env.sh`,
+   and renders both engine configs for that root. It never touches the GPU and
+   is safe to re-run.
+
+2. **Gateway.** Python 3.11+ with `aiohttp>=3.10`, then install the package and
+   the runit service:
 
    ```sh
-   cd "$STRATA_ROOT" && control/python/bin/python3 download_models.py
-   # writes downloads/model-verification.json; aborts on any size or hash mismatch
+   python3 -m venv /opt/flashnext-venv && /opt/flashnext-venv/bin/pip install 'aiohttp>=3.10'
+   sudo mkdir -p /opt/flashnext-app && sudo cp -r flashnext /opt/flashnext-app/
+   sudo cp -r runit/flashnext /etc/service/
    ```
 
-4. CPU-only preparation — pack the native expert blob, extract the tokenizer, fetch and
-   quantise the MTP draft head, build the draft runtime. It never touches CUDA or a server:
+   [`runit/flashnext/run`](runit/flashnext/run) reads `STRATA_ROOT`,
+   `FLASHNEXT_USER`, `FLASHNEXT_PYTHON`, `FLASHNEXT_APP_DIR` and
+   `FLASHNEXT_IDLE_SECONDS` from its environment; the defaults match the commands
+   above. It stays down until the runtime exists.
+
+3. **Check it.** `curl http://localhost:18098/status` never loads the model. The
+   real-model gate runs completion, a streamed tool call and idle unload through
+   its own gateway, so stop the service first:
 
    ```sh
-   ./prepare-cpu.sh          # ~16 GB of derived artifacts, CPU/network only
-   ./control/python/bin/python3 verify-cpu.py
-   # writes downloads/prepared-artifacts.json with hashes of everything it generated
+   sv stop flashnext
+   cd /opt/flashnext-app && sudo -u flashnext /opt/flashnext-venv/bin/python -m flashnext.smoke \
+     --root /srv/strata-runtime --evidence /tmp/smoke.json
+   sv start flashnext
    ```
 
-5. Materialise the engine profile (the templates use `__RUNTIME_ROOT__` placeholders):
+4. **Client.** Merge [`term-llm/provider.yaml`](term-llm/provider.yaml) into your
+   [term-llm](https://github.com/SamSaffron/term-llm) config. Any OpenAI-compatible
+   client works with model `flashnext`.
 
-   ```sh
-   sed "s|__RUNTIME_ROOT__|$STRATA_ROOT|g" strata-iq3-128k.json.tmpl > strata-iq3-128k.json
-   sed "s|__RUNTIME_ROOT__|$STRATA_ROOT|g" strata-iq3-64k.json.tmpl  > strata-iq3-64k.json
-   ```
+## Engine configuration
 
-6. Sanity-check the launch without touching the GPU (`strata serve --plan` validates and
-   prints the effective launch):
+[`strata/strata-iq3-128k.json.tmpl`](strata/strata-iq3-128k.json.tmpl); the 64K
+variant differs only in `--max-context`.
 
-   ```sh
-   cd "$STRATA_ROOT/control" && ./bin/strata serve --engine strata \
-     --config ../strata-iq3-128k.json --host 127.0.0.1 --port 18199 --parallel 1 --max-queue 1 \
-     --offline --plan
-   ```
-
-## Engine launch — every flag
-
-`launch.sh` is what the gateway runs. It refuses to start unless a human has confirmed the
-GPU is free, and it never touches anyone else's process:
-
-```sh
-STRATA_GPU_CONFIRMED_FREE=1 ./launch.sh [--context 64k|128k]
-```
-
-Guards, in order: `STRATA_GPU_CONFIRMED_FREE` must equal `1`; `nvidia-smi` must report
-≤ 2 048 MiB in use on GPU 0 (the host display holds ~1.2 GB); `downloads/prepared-artifacts.json`
-must exist; port 18199 must be free. Read-only checks only — it does not unload, stop,
-restart or modify an existing service.
-
-Profile (`strata-iq3-128k.json`, args array) and why each one is there:
-
-| flag | why |
+| Setting | Why |
 |---|---|
-| `--pack models/pack/iq3_xxs` | dense weights + tokenizer prepared from shard 1 by `prepare-cpu.sh` |
-| `--native …-00001-of-00002.gguf` | expert weights read in their native quantisation |
-| `--ple-gguf …-00002-of-00002.gguf` | the 28.8 GB PLE / n-gram lookup table |
-| `--ple-io direct` | unbuffered SSD reads for that table instead of 28.8 GB of extra resident RAM — mandatory at 62 GB system RAM |
-| `--expert-profile control/data/expert-profile.bin` | routing profile used to decide which experts to keep resident |
-| `--expert-cache auto` | grow the resident expert cache only into VRAM left after dense/head/draft/KV/workspaces. Note it is a count of "largest expert blob" units, **not MiB**; use `auto` until you have measured startup |
-| `--vram-reserve-mib 1024` | leave 1 GiB of VRAM unallocated; this is the difference between "loads" and "loads sometimes" |
-| `--prefill auto` | keep the documented CUDA chunk defaults (cap 8 192); chunks larger than that are opt-in and not bit-exact on CUDA |
-| `--spec 4 --spec-min-p 0.5` | speculative draft depth 4, accept threshold 0.5; proposals are always verified by the target model |
-| `--mtp models/mtp/rt` | the locally prepared MTP draft runtime (~0.7–1 GiB VRAM plus host draft data) |
-| `--max-context 131072` | 128K window; 128K is the documented upper recommendation for IQ3_XXS on a 64 GB machine |
-| `--kv int8` | quantised KV — unavoidable at 128K on 24 GB |
-| `--kv-resident 32768` | KV streaming: only ~32K tokens' KV lives in VRAM (~0.45 GB of cells), the rest (~1.8 GB at 128K) is hosted |
-| `--pool-workers 15` | expert I/O pool: P-cores minus one plus half the E-cores for a 14900K-class chip; do not blindly use all 32 logical threads |
-| `--prompt-cache 1` | one small prefix checkpoint (this is why repeated prompts show `cache_n > 0`) |
-| `--conversation-cache-mib 0` | disable the multi-conversation parking budget, whose automatic default can eat several GiB |
-| JSON `min_free_vram_mib: 23000` | the server itself refuses to load unless 23 GB is actually free |
-| JSON `reasoning_effort: medium`, `reasoning_budget_tokens: 2048` | default thinking budget; the gateway overrides the effort per request |
-| JSON `mtp: true`, `draft_vocab: cjk` | enable drafting with the prepared draft vocabulary |
-| JSON `fit_max_tokens: false` | an over-long request gets HTTP 400 instead of being silently shortened |
-| `--parallel 1 --max-queue 1` | one inference slot, one queued call; predictable memory on a shared card |
-| `--offline` | no remote image fetches, no MCP/tool subprocesses |
+| `--pack`, `--native`, `--ple-gguf` | dense weights and tokenizer packed from shard 1; experts read from shard 1 in their native quantisation; shard 2 is the n-gram lookup table |
+| `--ple-io direct` | read the lookup table from the SSD instead of holding 28.8 GB more in RAM |
+| `--expert-cache auto` | grow the VRAM expert cache into whatever is left after weights, draft head, KV and workspaces |
+| `--vram-reserve-mib 1024` | leave 1 GiB free; without it loading is unreliable |
+| `--spec 4 --spec-min-p 0.5`, `--mtp` | MTP speculative decoding, depth 4; every draft is verified by the full model |
+| `--max-context 131072` | 128K, the upstream recommendation for IQ3_XXS on a 64 GB machine |
+| `--kv int8 --kv-resident 32768` | int8 KV with only the latest 32K tokens in VRAM; the rest streams from RAM |
+| `--pool-workers 15` | expert I/O threads: P-cores minus one plus half the E-cores on a 14900K |
+| `--conversation-cache-mib 4096`, `-slots 3`, `-min-tokens 2048` | park up to three long conversations in RAM so a short side request (a Guardian review, a title, a second client) does not evict the main one |
+| `--conversation-cache-min-free-mib 4096` | stop parking before free RAM nears the gateway's 3 GB safety limit |
+| `fit_max_tokens: false` | an over-long request gets HTTP 400 instead of being silently cut |
+| `min_free_vram_mib: 23000` | the engine refuses to load onto a busy GPU |
 
-`strata-iq3-64k.json` is identical except `--max-context 65536`; use it if you want a
-like-for-like context ceiling with the old llama.cpp setup.
+## Gateway behaviour
 
-## Gateway
+[`flashnext/server.py`](flashnext/server.py), an `aiohttp` app on port 18098 and
+the only thing exposed to the network.
 
-`gateway/server.py` (~270 lines of `aiohttp`) is the only thing bound to the network. It is
-a proxy plus a lifecycle manager, and it is deliberately paranoid about the GPU:
+- **Lazy.** The first chat request starts the engine; it stops after the idle
+  timeout (600 s in the service). `/v1/models` and `/status` never load anything.
+- **Queue.** One request runs at a time. Others wait in order for up to 30 s,
+  at most 4 of them, then get `429` with `Retry-After`.
+- **Reasoning.** Efforts `none` (default), `low`, `medium`, `xhigh` (`high` is
+  an alias). Thinking shares `max_tokens` with the answer, so each effort gets a
+  thinking budget (1K / 4K / 8K), cut further when needed to keep 4K of
+  `max_tokens` for the reply. A budget of 0 is never sent: Strata reads it as
+  unlimited.
+- **Safety.** It loads only if the GPU has under 2 GB in use and 8 GB of RAM is
+  available, and stops the engine if available RAM falls below 3 GB. A
+  disconnecting client cancels its request but keeps the engine and its cache.
+- **Size.** Request bodies are capped at 1 MiB. Real code and prose run ~4 bytes
+  per token, so a full 128K window is about 0.5 MiB.
+- **Trust.** No authentication, like Ollama. Keep it on a trusted LAN.
 
-- **Lazy load.** Nothing is loaded at boot. `/v1/models` and `/status` never load weights.
-  The first inference request spawns `launch.sh`.
-- **Idle unload.** After `--idle` seconds without traffic the engine is terminated and VRAM
-  is released. Deployed with `--idle 600`; the script default is 120.
-- **Admission guard (503).** Before loading: refuse if `nvidia-smi` reports ≥ 2 000 MiB used
-  by any process, or `MemAvailable` < 8 192 MiB.
-- **Watchdog.** During operation the engine is killed if `MemAvailable` < 3 072 MiB, or on idle.
-- **Single slot.** One in-flight request; anything concurrent gets `429 {"error":"FlashNext busy"}`
-  (observed in my own run: a follow-up request fired 1 ms after the previous completion got 429).
-- **GPU lease.** `flock` on `/tmp/local-llm-optional-gpu.lock` so a second gateway cannot start.
-- **Model id `flashnext`.** Backend profiles are selected by `--backend`:
+## Sharing the GPU with Ollama (optional)
 
-  | backend | engine port | context | max output | thinking budgets | answer reserve |
-  |---|---|---|---|---|---|
-  | `strata` (current) | 18199 | 131 072 | 16 384 | low 1 024 / medium 4 096 / xhigh 8 192 | 4 096 |
-  | `llamacpp` (legacy) | 18099 | 65 536 | 4 096 | low 512 / medium 1 024 / xhigh 2 560 | 1 536 |
+FlashNext and a large Ollama model do not fit on the card together, so whichever
+is asked last gets the GPU. Ollama decides how many layers fit when it loads, so
+the swap has to happen before the request reaches it:
 
-- **Reasoning efforts.** `none`, `low`, `medium`, `xhigh`; `high` aliases to `xhigh`; default
-  `none`. The budget is injected as `reasoning_budget_tokens` (Strata does its own wrap-up
-  injection, so the gateway's `reasoning_budget_message` hack is only used for llama.cpp),
-  and it is capped so `max_tokens - reserve` is never exceeded — otherwise thinking eats the
-  whole answer.
-- **Request cap.** `client_max_size` is 1 MiB; a 100k-token synthetic prompt is ~180 KB, so
-  long-context clients are fine, giant JSON bodies are not.
-- **Unauthenticated, LAN-trusted.** It binds `0.0.0.0` in the deployed config. Keep it on a
-  trusted network; do not expose it.
+1. Move the GPU Ollama to loopback (`OLLAMA_HOST=127.0.0.1:11436`) and install
+   [`runit/ollama-proxy`](runit/ollama-proxy/run), which takes over port 11434.
+2. Before an inference request, the proxy calls the gateway's loopback-only
+   `POST /release`. An idle engine unloads at once, a busy one after its current
+   request, and the proxy waits for the VRAM before forwarding unchanged.
+   Listings, pulls and uploads pass straight through, and a gateway failure
+   never blocks Ollama.
+3. In the other direction the gateway asks Ollama to unload its GPU models
+   before loading (`--ollama-url`, default `http://127.0.0.1:11436`; empty
+   disables).
 
-## runit service
+## Lessons from running agents on it
 
-`runit/run` — enabled at image build time, but a provisioning gate keeps it down until the
-runtime root actually exists:
+- **Output limits matter more than speed.** With a 4K output cap an agent writing
+  a 150-line file ran out of tokens three times; 16K fixed it.
+- **Keep the conversation cache on.** With one prompt cache, any side request
+  costs the agent a full re-read of its context.
+- **Queue, don't reject.** Agents and their helpers overlap; a 429 for a request
+  that would have waited ten seconds just causes retries.
+- **Restarts need `SO_REUSEADDR`.** Without it, sockets in TIME_WAIT from a
+  just-stopped engine made the port check fail for about a minute.
 
-```sh
-config=__STATE_DIR__/root                    # a small file whose only content is $STRATA_ROOT
-test -s "$config" || { echo 'not provisioned'; exec sleep 60; }
-root=$(cat "$config")
-exec chpst -u __USER__ __VENV__/bin/python -m flashnext.server \
-    --backend strata --root "$root" --host 0.0.0.0 --idle 600
-```
-
-(Set `STRATA_ROOT` in `gateway/server.py` too: it is the path used for the engine log and for
-finding `launch.sh`, and it must match `--root`.)
-
-## term-llm provider
-
-`term-llm/provider.yaml` — the live entry, matching the strata profile:
-
-```yaml
-providers:
-  flashnext:
-    type: openai_compatible
-    base_url: http://<host>:18098/v1
-    model: flashnext
-    context_window: 131072
-    max_output_tokens: 16384
-    models:
-      - id: flashnext
-        reasoning_efforts: [none, low, medium, xhigh]
-        default_reasoning_effort: none
-```
-
-Worth knowing: this assistant runs on that endpoint, on the box it is describing, with a
-single inference slot. So it interrupts itself whenever it talks to you.
-
-## Reproducing the benchmark
-
-`bench/BENCHMARK.md` is the honest methodology; read it before quoting anything. Short version:
-
-```sh
-cd "$STRATA_ROOT"
-STRATA_RUNTIME="$PWD" python3 bench/bench_driver.py 700
-```
-
-`bench_driver.py` waits for the lazy gateway engine to unload on its own (it will not stop a
-running service), then runs `benchmark.py --measure-load`, which starts `launch.sh` as its own
-child, polls `/health` until `loaded:true`, runs the ladder, and SIGTERMs only its own child.
-If no free window appears it says so in the JSONL (`cold_ladder_skipped`) and falls back to
-warm gateway probes rather than pretending the numbers were cold.
-
-Two runs are included: `results-A-20261031T1306Z.jsonl` and `results-B-20261031T1941Z.jsonl`
-(2026-11-01 00:06 and 06:41 Sydney), plus the engine stdout/cold-load log for run A.
-
-Things these numbers are not:
-
-- **Not** a disk-cold measurement. "Cold load" means a new process; the OS page cache is
-  uncontrolled (no `drop_caches`, no reboot). That is why 16.0 s and 26.5 s differ.
-- `prompt_tokens_over_ttft_estimate` is **not** pure prefill throughput — it includes HTTP,
-  templating, scheduling and first-output overhead. The tables above use the engine's
-  `prompt_per_second`.
-- `client_decode_tok_s_estimate` is an estimate (SSE chunks are not tokens, MTP bursts,
-  detokeniser buffering). Server timings are authoritative.
-- Cached prompt tokens are disclosed separately (`timings.cache_n`,
-  `usage.prompt_tokens_details.cached_tokens`) and are not counted as newly processed prefill.
-- IQ3_XXS vs the legacy UD-IQ4_XS is **not** a like-for-like quality comparison. Faster here
-  does not mean better; different quantisation, different context ceiling, different runtime.
-- Part of the production traffic on this engine is this assistant's own session, which is why
-  the driver insists on a verified free window before timing anything.
-
-## Smoke tests
-
-`benchmark.py --smoke` (part of both recorded runs) sends a bounded-thinking request
-(`reasoning_effort medium`, 128-token budget) and a streamed `echo` function call, reconstructs
-the argument fragments and checks the final tool envelope without executing the tool. Both
-passed in both runs: `reasoning_content_present: true`, `tool_format_check_passed: true`
-(`{"text":"READY"}`, `finish_reason: tool_calls`).
-
-```sh
-python3 -m pytest gateway/test_server.py bench/test_benchmark.py
-```
-
-## File map
+## Repository
 
 ```
-runtime/            env.sh, launch.sh, bin/strata, config templates, download/prepare/verify scripts
-runtime/downloads/  pinned HF metadata, model verification, prepared-artifact hashes, script hashes
-runtime/provenance/ Strata Control VERSION+COMMIT, BUNDLE.json, engine BUILD.json + file hashes
-gateway/            server.py, test_server.py, launch-llamacpp.sh (legacy backend)
-runit/run           service definition with the provisioning gate
-term-llm/           provider.yaml entry
-bench/              benchmark.py, bench_driver.py, BENCHMARK.md, results-A/B JSONL, engine logs
-models/             expected.sha256 (strata), expected-llamacpp.sha256 (legacy)
-docs/               legacy-llamacpp.md, model-card.ISTA-DASLab.md
+flashnext/   gateway (server.py), Ollama proxy, smoke test, llama.cpp launcher, tests
+strata/      install.sh, launch.sh, env.sh, engine config templates, download and prepare scripts
+runit/       service scripts for the gateway and the optional Ollama proxy
+term-llm/    provider entry
+bench/       benchmark harness, raw results, methodology
+provenance/  pinned metadata, weight and artifact hashes, Strata build info
+docs/        the llama.cpp backend this replaced
 ```
 
-Host-specific paths are replaced with `__RUNTIME_ROOT__`, `__STATE_DIR__`, `__USER__`,
-`__VENV__`, `__APP_DIR__` — substitute your own.
+`make check` runs the unit tests, script syntax checks and shellcheck without a
+GPU, model or network; CI runs it on every push.
 
-## Licences
+## Provenance
 
-Strata is MIT (`LICENSE.Strata`, upstream `Niko1221/Strata`, v0.2.9); the bundled engine
-component hashes are just provenance. The model and its card are Apache-2.0 per the
-ISTA-DASLab repo. `gguf-py` used by `prepare-cpu.sh` comes from llama.cpp commit
-`3cf03257f219afbe7334045ff7c6a06ac68c627d` (MIT). The gateway, launch and benchmark scripts
-are mine — no licence file is asserted for them here, so consider them "all rights reserved"
-unless I add one.
+| | Pin |
+|---|---|
+| Weights | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF` @ `ed59f92`, `IQ3_XXS/`, 75.84 GB in 2 shards |
+| MTP draft source | `Qwen/Qwen3.8-Flash-Next` @ `de4b8e4`, quantised locally to Q2_0 |
+| Strata | v0.2.9: Control 0.1.55, engine 0.1.55 CUDA 13 (bundles its CUDA libraries) |
+| gguf-py | llama.cpp `3cf0325` (packing tools only) |
+
+Full hashes are in `strata/install.sh` and [`provenance/`](provenance/).
+
+## Licence
+
+MIT for this repository ([LICENSE](LICENSE)). Strata is MIT, the ISTA-DASLab
+weights are Apache-2.0, and llama.cpp's `gguf-py` is MIT.

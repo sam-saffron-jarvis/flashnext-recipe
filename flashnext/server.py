@@ -1,4 +1,4 @@
-"""Lazy, bounded OpenAI chat proxy. Listing models never loads weights."""
+"""Lazy, bounded OpenAI chat gateway for FlashNext. Listing models never loads weights."""
 import argparse
 import asyncio
 import fcntl
@@ -23,7 +23,6 @@ ANSWER_RESERVE_TOKENS = 1536
 REASONING_BUDGET_MESSAGE = "\n\n(Thinking budget reached. Stop deliberating; give the answer or make the next tool call now.)\n"
 UPSTREAM = "http://127.0.0.1:18099"
 BACKEND = "llamacpp"
-STRATA_ROOT = Path("__RUNTIME_ROOT__")  # edit to your runtime root; must match --root
 # Engine profiles. llamacpp is the original UD-IQ4_XS recipe (kept for
 # rollback); strata serves ISTA-DASLab IQ3_XXS ~5x faster decode and ~9x
 # faster prefill on the same card, with 128K context.
@@ -48,21 +47,83 @@ def available_memory():
     return int(next(line.split()[1] for line in Path("/proc/meminfo").read_text().splitlines() if line.startswith("MemAvailable:"))) // 1024
 
 
-async def resource_check():
+GPU_FREE_BELOW_MIB = 2000   # the host display alone holds ~1.2 GB
+
+
+async def gpu_used_mib():
     proc = await asyncio.create_subprocess_exec("nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", stdout=asyncio.subprocess.PIPE)
     out, _ = await asyncio.wait_for(proc.communicate(), 5)
-    if proc.returncode or max(map(int, out.split())) >= 2000 or available_memory() < 8192:
+    if proc.returncode:
+        raise RuntimeError("nvidia-smi failed")
+    return max(map(int, out.split()))
+
+
+async def resource_check():
+    if await gpu_used_mib() >= GPU_FREE_BELOW_MIB or available_memory() < 8192:
         raise RuntimeError("GPU busy or insufficient RAM; no other service will be evicted")
 
 
+OLLAMA_GPU_URL = "http://127.0.0.1:11436"   # the GPU Ollama, behind ollama_proxy; "" disables
+
+
+async def free_gpu_from_ollama(session, url=None, timeout=30):
+    """Ask the GPU Ollama to unload whatever it holds on the GPU, then wait for the VRAM.
+
+    Ollama unloads a keep_alive:0 model only after its in-flight requests finish, so
+    a running answer is never cut off; we just wait (bounded) for the memory.
+    Talks to Ollama directly, not through the proxy, so it cannot trigger a
+    release of FlashNext itself. Returns True when the GPU is free afterwards.
+    """
+    url = OLLAMA_GPU_URL if url is None else url
+    if not url:
+        return False
+    try:
+        async with session.get(url + "/api/ps", timeout=ClientTimeout(total=5)) as r:
+            models = (await r.json()).get("models") or []
+    except (OSError, asyncio.TimeoutError, ValueError):
+        return False
+    held = [m["name"] for m in models if m.get("size_vram")]
+    if not held:
+        return False
+    for name in held:
+        try:
+            async with session.post(url + "/api/generate", json={"model": name, "keep_alive": 0},
+                                    timeout=ClientTimeout(total=10)) as r:
+                await r.read()
+        except (OSError, asyncio.TimeoutError):
+            pass
+    print(f"flashnext: asked Ollama to unload {', '.join(held)}", flush=True)
+    return await wait_for_gpu_free(timeout)
+
+
+async def wait_for_gpu_free(timeout=15):
+    """After stopping the engine, wait until the driver has actually released its VRAM."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if await gpu_used_mib() < GPU_FREE_BELOW_MIB:
+                return True
+        except (RuntimeError, OSError, asyncio.TimeoutError):
+            return False
+        await asyncio.sleep(0.5)
+    return False
+
+
 class Engine:
-    def __init__(self, root, idle=120):
+    def __init__(self, root, idle=120, queue_seconds=30, max_queue=4):
         self.root, self.idle = Path(root), idle
         self.process = None
         self.log = None
         self.lease = None
         self.busy = False
         self.last = time.monotonic()
+        # One request runs at a time. Others wait FIFO (asyncio.Lock wakes
+        # waiters in order) for up to queue_seconds, at most max_queue of them,
+        # instead of failing instantly with 429. Short side requests such as
+        # term-llm Guardian reviews then run between agent turns.
+        self.slot = asyncio.Lock()
+        self.queue_seconds, self.max_queue = queue_seconds, max_queue
+        self.waiting = 0
 
     async def stop(self):
         if self.process:
@@ -98,12 +159,19 @@ class Engine:
             sock.bind(("127.0.0.1", BACKENDS[BACKEND]["port"]))
         self.lease = open("/tmp/local-llm-optional-gpu.lock", "a")
         fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            if await gpu_used_mib() >= GPU_FREE_BELOW_MIB:
+                # Newest request wins the single GPU: evict Ollama's models
+                # (after any answer in progress), as Ollama's proxy evicts us.
+                await free_gpu_from_ollama(session)
+        except (RuntimeError, OSError, asyncio.TimeoutError):
+            pass
         await resource_check()
         if BACKEND == "strata":
-            self.log = STRATA_ROOT.joinpath("logs", "gateway-engine.log").open("ab")
+            self.log = self.root.joinpath("logs", "gateway-engine.log").open("ab")
             # launch.sh keeps its own read-only GPU guard; admission above already
             # established that the GPU is free.
-            argv, env, ready = ["bash", str(STRATA_ROOT / "launch.sh")], dict(os.environ, STRATA_GPU_CONFIRMED_FREE="1"), "/health"
+            argv, env, ready = ["bash", str(self.root / "launch.sh")], dict(os.environ, STRATA_GPU_CONFIRMED_FREE="1"), "/health"
         else:
             self.log = self.root.joinpath("appliance-engine.log").open("ab")
             argv, env, ready = ["sh", str(Path(__file__).with_name("launch.sh"))], dict(os.environ, FLASHNEXT_ROOT=str(self.root)), "/v1/models"
@@ -191,7 +259,7 @@ def application(engine):
         return web.json_response({"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": "local-llm", "context_length": CONTEXT_WINDOW, "top_provider": {"max_completion_tokens": MAX_OUTPUT_TOKENS}, "reasoning_efforts": list(REASONING_EFFORTS), "default_reasoning_effort": DEFAULT_REASONING_EFFORT}]})
 
     async def status(request):
-        return web.json_response({"loaded": bool(engine.process and engine.process.returncode is None), "busy": engine.busy, "idle_seconds": engine.idle, "configured_context_window": CONTEXT_WINDOW, "backend": BACKEND, "max_output_tokens": MAX_OUTPUT_TOKENS})
+        return web.json_response({"loaded": bool(engine.process and engine.process.returncode is None), "busy": engine.busy, "queued": engine.waiting, "queue_seconds": engine.queue_seconds, "max_queue": engine.max_queue, "idle_seconds": engine.idle, "configured_context_window": CONTEXT_WINDOW, "backend": BACKEND, "max_output_tokens": MAX_OUTPUT_TOKENS})
 
     async def chat(request):
         try:
@@ -213,8 +281,21 @@ def application(engine):
             configure_reasoning(body)
         except ValueError as error:
             return web.json_response({"error": {"message": str(error), "type": "invalid_request_error", "param": "reasoning_effort"}}, status=422)
-        if engine.busy:
-            return web.json_response({"error": "FlashNext busy"}, status=429)
+        if engine.slot.locked() and engine.waiting >= engine.max_queue:
+            return web.json_response({"error": f"FlashNext busy; queue full ({engine.max_queue} waiting)"},
+                                     status=429, headers={"Retry-After": "5"})
+        engine.waiting += 1
+        try:
+            await asyncio.wait_for(engine.slot.acquire(), engine.queue_seconds)
+        except asyncio.TimeoutError:
+            return web.json_response({"error": f"FlashNext busy; waited {engine.queue_seconds:g}s in queue"},
+                                     status=429, headers={"Retry-After": "5"})
+        finally:
+            engine.waiting -= 1
+        if request.transport is None or request.transport.is_closing():
+            # The client gave up while queued; do not spend the GPU on it.
+            engine.slot.release()
+            return web.Response(status=499)
         engine.busy = True
         response = None
         try:
@@ -241,6 +322,37 @@ def application(engine):
         finally:
             engine.busy = False
             engine.last = time.monotonic()
+            engine.slot.release()
+
+    async def release(request):
+        """Free the GPU for another local service (the Ollama proxy calls this).
+
+        Loopback only. Idle engine: unload now. Busy engine: wait up to
+        ?wait= seconds (default queue_seconds) for the slot, then unload.
+        Holding the slot while stopping keeps a racing chat request from
+        reloading mid-stop; it simply queues and reloads afterwards.
+        """
+        if request.remote not in ("127.0.0.1", "::1"):
+            return web.json_response({"error": "release is loopback-only"}, status=403)
+        try:
+            wait = float(request.query.get("wait", engine.queue_seconds))
+        except ValueError:
+            return web.json_response({"error": "wait must be a number"}, status=422)
+        if not (engine.process and engine.process.returncode is None):
+            return web.json_response({"released": False, "loaded": False})
+        try:
+            await asyncio.wait_for(engine.slot.acquire(), max(0.0, wait))
+        except asyncio.TimeoutError:
+            return web.json_response({"released": False, "loaded": True, "busy": True}, status=409)
+        try:
+            loaded = bool(engine.process and engine.process.returncode is None)
+            if loaded:
+                await engine.stop()
+                await wait_for_gpu_free()
+            return web.json_response({"released": loaded, "loaded": False})
+        finally:
+            engine.last = time.monotonic()
+            engine.slot.release()
 
     async def lifecycle(app):
         async with ClientSession(timeout=ClientTimeout(total=600)) as client:
@@ -257,6 +369,7 @@ def application(engine):
     app.router.add_get("/v1/models", models)
     app.router.add_get("/status", status)
     app.router.add_post("/v1/chat/completions", chat)
+    app.router.add_post("/release", release)
     return app
 
 
@@ -266,9 +379,17 @@ if __name__ == "__main__":
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=18098)
     p.add_argument("--idle", type=int, default=120)
-    p.add_argument("--backend", choices=sorted(BACKENDS), default="llamacpp")
+    p.add_argument("--backend", choices=sorted(BACKENDS), default="strata")
+    p.add_argument("--queue-seconds", type=float, default=30, help="how long a request may wait for the single slot")
+    p.add_argument("--max-queue", type=int, default=4, help="requests allowed to wait at once; more get 429")
+    p.add_argument("--ollama-url", default=OLLAMA_GPU_URL,
+                   help="GPU Ollama to evict before loading (empty string disables)")
     args = p.parse_args()
+    OLLAMA_GPU_URL = args.ollama_url.rstrip("/")
     if args.idle < 1:
         p.error("idle must be positive")
+    if args.queue_seconds < 0 or args.max_queue < 0:
+        p.error("queue settings must be non-negative")
     select_backend(args.backend)
-    web.run_app(application(Engine(args.root, args.idle)), host=args.host, port=args.port, access_log=None)
+    web.run_app(application(Engine(args.root, args.idle, args.queue_seconds, args.max_queue)),
+                host=args.host, port=args.port, access_log=None)

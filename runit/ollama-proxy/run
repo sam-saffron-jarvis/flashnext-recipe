@@ -1,0 +1,14 @@
+#!/bin/sh
+# Optional: owns Ollama's public port and frees the GPU from an idle FlashNext
+# before each inference request. Move the GPU Ollama itself to loopback first
+# (OLLAMA_HOST=127.0.0.1:11436 in its service environment).
+set -eu
+exec 2>&1
+APP_DIR=${FLASHNEXT_APP_DIR:-/opt/flashnext-app}
+PYTHON=${FLASHNEXT_PYTHON:-/opt/flashnext-venv/bin/python}
+RUN_AS=${FLASHNEXT_USER:-flashnext}
+cd "$APP_DIR"
+exec chpst -u "$RUN_AS" "$PYTHON" -m flashnext.ollama_proxy \
+    --host 0.0.0.0 --port 11434 \
+    --upstream "${OLLAMA_UPSTREAM:-http://127.0.0.1:11436}" \
+    --release-url "${FLASHNEXT_RELEASE_URL:-http://127.0.0.1:18098/release}"

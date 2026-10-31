@@ -1,5 +1,5 @@
 # Source from bash; state and caches stay on the appliance data drive.
-STRATA_ROOT=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+STRATA_ROOT=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 export STRATA_ROOT
 export HOME="$STRATA_ROOT/home"
 export XDG_DATA_HOME="$STRATA_ROOT/data" XDG_CONFIG_HOME="$STRATA_ROOT/config"

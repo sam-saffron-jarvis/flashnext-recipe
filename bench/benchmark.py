@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Opt-in sequential Strata benchmark. NEVER run during runtime preparation.
+"""Opt-in sequential Strata benchmark against a directly launched engine.
 
 Default is a dry plan. --run AND --i-confirm-gpu-is-free authorize requests.
---measure-load additionally starts launch.sh as an owned child, and closes only
-that child afterward. It never unloads or changes any other service.
+--measure-load additionally starts the runtime's launch.sh as an owned child,
+and closes only that child afterward. It never unloads or changes any other
+service, so stop the flashnext gateway first (it owns the GPU and port 18199).
+Logs and results are written under the runtime root, never the checkout.
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(os.environ.get("STRATA_ROOT", Path.home() / "strata-runtime"))
 
 
 def facts(target: int, instruction: str) -> tuple[str, int]:
@@ -159,7 +161,9 @@ def measure_load(args, emit):
 
 
 def main():
+    global ROOT
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--root", type=Path, default=ROOT, help="Strata runtime root (default $STRATA_ROOT or %(default)s)")
     ap.add_argument("--url", default="http://127.0.0.1:18199/v1/chat/completions")
     ap.add_argument("--model", default="strata")
     ap.add_argument("--run", action="store_true")
@@ -173,6 +177,7 @@ def main():
     ap.add_argument("--output", type=Path, help="JSONL (default results/benchmark-<time>.jsonl)")
     ap.add_argument("--self-test", action="store_true", help="pure CPU SSE parser/synthetic-prompt checks")
     args = ap.parse_args()
+    ROOT = args.root
     if args.self_test:
         import io
         got = list(events(io.BytesIO(b'data: {"choices":[]}\n\ndata: [DONE]\n\n')))

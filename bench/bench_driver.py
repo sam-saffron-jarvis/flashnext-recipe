@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Drive a full benchmark window against a live FlashNext (Strata) deployment.
 
-This is the script that produced bench/results-*.jsonl. It is deliberately
+This is the script that produced bench/results/run-*.jsonl. It is deliberately
 conservative: it never stops, restarts, or unloads an existing service. It waits
 for the lazy gateway engine to release the GPU on its own, then benchmarks only a
 process it owns.
 
-  export STRATA_RUNTIME=/path/to/strata-runtime     # root with control/, models/, launch.sh
-  python3 bench_driver.py [max_seconds_to_wait_for_an_idle_window]
+  export STRATA_ROOT=/path/to/strata-runtime        # as passed to install.sh
+  python3 bench/bench_driver.py [max_seconds_to_wait_for_an_idle_window]
 
 Sequence
   A  wait for the gateway engine to idle out (default 700 s)
@@ -32,11 +32,12 @@ import time
 import urllib.request
 from types import SimpleNamespace
 
-ROOT = pathlib.Path(os.environ.get("STRATA_RUNTIME", "."))
+ROOT = pathlib.Path(os.environ.get("STRATA_ROOT") or os.environ.get("STRATA_RUNTIME") or pathlib.Path.home() / "strata-runtime")
+HERE = pathlib.Path(__file__).resolve().parent
 GATEWAY = os.environ.get("FLASHNEXT_GATEWAY", "http://127.0.0.1:18098")
 ENGINE_PORT = int(os.environ.get("FLASHNEXT_ENGINE_PORT", "18199"))
 
-spec = importlib.util.spec_from_file_location("fnbench", ROOT / "benchmark.py")
+spec = importlib.util.spec_from_file_location("fnbench", HERE / "benchmark.py")
 bench = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(bench)
@@ -109,7 +110,7 @@ def main():
 
     # ---- B: cold ladder from a fresh engine process (owned child only) ----
     if cold_ladder_ok:
-        cmd = [str(ROOT / "control/python/bin/python3"), str(ROOT / "benchmark.py"),
+        cmd = [str(ROOT / "control/python/bin/python3"), str(HERE / "benchmark.py"), "--root", str(ROOT),
                "--run", "--i-confirm-gpu-is-free", "--measure-load", "--launch-context", "128k",
                "--rounds", "3", "--smoke", "--output", str(OUT)]
         t0 = time.monotonic()

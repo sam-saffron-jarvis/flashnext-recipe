@@ -44,16 +44,134 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("reasoning_effort", (await r.json())["error"]["message"])
         self.assertIsNone(self.engine.process)
 
-    async def test_contention_is_bounded(self):
-        self.engine.busy = True
-        r = await self.client.post("/v1/chat/completions", json={"model": "flashnext", "messages": [{}]})
-        self.assertEqual(r.status, 429)
+    async def test_contention_waits_then_times_out(self):
+        import time
+        self.engine.queue_seconds = 0.3
+        await self.engine.slot.acquire()
+        try:
+            t0 = time.monotonic()
+            r = await self.client.post("/v1/chat/completions", json={"model": "flashnext", "messages": [{}]})
+            self.assertEqual(r.status, 429)
+            self.assertEqual(r.headers.get("Retry-After"), "5")
+            self.assertGreaterEqual(time.monotonic() - t0, 0.3)
+            self.assertEqual(self.engine.waiting, 0)
+        finally:
+            self.engine.slot.release()
+
+    async def test_queued_request_runs_when_slot_frees(self):
+        import asyncio, time
+        self.engine.queue_seconds = 5
+        await self.engine.slot.acquire()
+        with patch.object(self.engine, "start", side_effect=RuntimeError("stub engine")):
+            t0 = time.monotonic()
+            task = asyncio.create_task(self.client.post("/v1/chat/completions", json={"model": "flashnext", "messages": [{}]}))
+            await asyncio.sleep(0.3)
+            self.assertEqual(self.engine.waiting, 1)
+            self.engine.slot.release()
+            r = await task
+            # 503 from the stubbed load proves it got past the queue rather than being refused.
+            self.assertEqual(r.status, 503)
+            self.assertGreaterEqual(time.monotonic() - t0, 0.3)
+        self.assertFalse(self.engine.slot.locked())
+
+    async def test_queued_requests_are_fifo(self):
+        import asyncio
+        self.engine.queue_seconds = 5
+        done = []
+
+        async def fake_start(session):
+            await asyncio.sleep(0.1)   # hold the slot long enough to separate completions
+            raise RuntimeError("stub engine")
+
+        await self.engine.slot.acquire()
+        with patch.object(self.engine, "start", side_effect=fake_start):
+            tasks = []
+            for i in range(3):
+                t = asyncio.create_task(self.client.post(
+                    "/v1/chat/completions", json={"model": "flashnext", "messages": [{"role": "user", "content": str(i)}]}))
+                t.add_done_callback(lambda _t, i=i: done.append(i))
+                tasks.append(t)
+                await asyncio.sleep(0.05)
+            self.assertEqual(self.engine.waiting, 3)
+            self.engine.slot.release()
+            statuses = [(await t).status for t in tasks]
+        self.assertEqual(statuses, [503, 503, 503])
+        self.assertEqual(done, [0, 1, 2])
+
+    async def test_full_queue_rejects_immediately(self):
+        import time
+        self.engine.queue_seconds, self.engine.max_queue = 5, 0
+        await self.engine.slot.acquire()
+        try:
+            t0 = time.monotonic()
+            r = await self.client.post("/v1/chat/completions", json={"model": "flashnext", "messages": [{}]})
+            self.assertEqual(r.status, 429)
+            self.assertLess(time.monotonic() - t0, 1)
+        finally:
+            self.engine.slot.release()
+
+    async def test_release_when_not_loaded_is_a_noop(self):
+        r = await self.client.post("/release")
+        self.assertEqual(await r.json(), {"released": False, "loaded": False})
+
+    async def test_release_unloads_idle_engine(self):
+        from unittest.mock import AsyncMock
+
+        class Proc:
+            returncode = None
+        self.engine.process = Proc()
+
+        async def fake_stop():
+            self.engine.process = None
+        with patch.object(self.engine, "stop", side_effect=fake_stop) as stop, \
+             patch("flashnext.server.wait_for_gpu_free", new_callable=AsyncMock) as freed:
+            r = await self.client.post("/release")
+            self.assertEqual(await r.json(), {"released": True, "loaded": False})
+            stop.assert_called_once()
+            freed.assert_awaited_once()
+        self.assertFalse(self.engine.slot.locked())
+
+    async def test_release_waits_for_busy_engine_then_gives_up(self):
+        class Proc:
+            returncode = None
+        self.engine.process = Proc()
+        await self.engine.slot.acquire()
+        try:
+            with patch.object(self.engine, "stop") as stop:
+                r = await self.client.post("/release?wait=0.2")
+                self.assertEqual(r.status, 409)
+                self.assertTrue((await r.json())["busy"])
+                stop.assert_not_called()
+        finally:
+            self.engine.slot.release()
+            self.engine.process = None
+
+    async def test_release_runs_after_busy_request_finishes(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        class Proc:
+            returncode = None
+        self.engine.process = Proc()
+
+        async def fake_stop():
+            self.engine.process = None
+        await self.engine.slot.acquire()
+        with patch.object(self.engine, "stop", side_effect=fake_stop), \
+             patch("flashnext.server.wait_for_gpu_free", new_callable=AsyncMock):
+            task = asyncio.create_task(self.client.post("/release?wait=5"))
+            await asyncio.sleep(0.2)
+            self.assertFalse(task.done())
+            self.engine.slot.release()
+            r = await task
+            self.assertEqual((await r.json())["released"], True)
 
     async def test_failed_load_releases_busy(self):
         with patch.object(self.engine, "start", side_effect=RuntimeError("busy GPU")):
             r = await self.client.post("/v1/chat/completions", json={"model": "flashnext", "messages": [{}]})
             self.assertEqual(r.status, 503)
             self.assertFalse(self.engine.busy)
+            self.assertFalse(self.engine.slot.locked())
 
     async def test_idle_reaps(self):
         import asyncio
@@ -67,6 +185,55 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
             stop.assert_awaited()
         self.engine.process = None
+
+
+class OllamaEvictionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from aiohttp import web, ClientSession
+        self.calls = []
+        self.models = [{"name": "qwen3.8:27b-instruct", "size": 18, "size_vram": 18},
+                       {"name": "cpu-only", "size": 5, "size_vram": 0}]
+
+        async def ps(request):
+            self.calls.append(("ps",))
+            return web.json_response({"models": self.models})
+
+        async def generate(request):
+            body = await request.json()
+            self.calls.append(("generate", body))
+            return web.json_response({"done": True, "done_reason": "unload"})
+
+        app = web.Application()
+        app.router.add_get("/api/ps", ps)
+        app.router.add_post("/api/generate", generate)
+        self.server = TestServer(app)
+        await self.server.start_server()
+        self.url = str(self.server.make_url("")).rstrip("/")
+        self.session = ClientSession()
+
+    async def asyncTearDown(self):
+        await self.session.close()
+        await self.server.close()
+
+    async def test_unloads_gpu_models_only_then_waits(self):
+        from unittest.mock import AsyncMock
+        from flashnext.server import free_gpu_from_ollama
+        with patch("flashnext.server.wait_for_gpu_free", new_callable=AsyncMock, return_value=True) as wait:
+            self.assertTrue(await free_gpu_from_ollama(self.session, self.url, timeout=7))
+            wait.assert_awaited_once_with(7)
+        self.assertEqual(self.calls, [("ps",), ("generate", {"model": "qwen3.8:27b-instruct", "keep_alive": 0})])
+
+    async def test_nothing_on_gpu_means_no_unload(self):
+        from flashnext.server import free_gpu_from_ollama
+        self.models = [{"name": "cpu-only", "size": 5, "size_vram": 0}]
+        self.assertFalse(await free_gpu_from_ollama(self.session, self.url))
+        self.assertEqual(self.calls, [("ps",)])
+
+    async def test_unreachable_or_disabled_ollama_is_harmless(self):
+        from flashnext.server import free_gpu_from_ollama
+        await self.server.close()
+        self.assertFalse(await free_gpu_from_ollama(self.session, self.url))
+        self.assertFalse(await free_gpu_from_ollama(self.session, ""))
 
 
 class ProfileTests(unittest.TestCase):

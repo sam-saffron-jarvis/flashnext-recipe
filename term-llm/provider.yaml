@@ -1,9 +1,11 @@
-# The live provider entry. Merge into term-llm config providers: after endpoint smoke.
-# context_window / max_output_tokens must match the engine profile you launch (128K here).
+# term-llm provider entry for the FlashNext gateway. Merge under `providers:` in
+# the term-llm config, replace <gateway-host>, then restart term-llm so it reads
+# the limits. They match the Strata 128K profile; for the llama.cpp backend use
+# context_window 65536 and max_output_tokens 4096.
 providers:
   flashnext:
     type: openai_compatible
-    base_url: http://__HOST__:18098/v1
+    base_url: http://<gateway-host>:18098/v1
     model: flashnext
     context_window: 131072
     max_output_tokens: 16384
