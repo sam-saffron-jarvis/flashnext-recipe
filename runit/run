@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 exec 2>&1
-export HOME=<home>
-config=<state-dir>/root
+export HOME=__HOME__
+config=__STATE_DIR__/root
 if [ ! -s "$config" ]; then
     echo 'flashnext: not provisioned; waiting for explicit runtime adoption'
     exec sleep 60
 fi
 root=$(cat "$config")
-cd /opt/flashnext-app
-exec chpst -u <user> /opt/duplex-venv/bin/python -m flashnext.server --root "$root" --host 0.0.0.0 --idle 600
+cd __APP_DIR__
+exec chpst -u __USER__ __VENV__/bin/python -m flashnext.server --backend strata --root __RUNTIME_ROOT__ --host 0.0.0.0 --idle 600

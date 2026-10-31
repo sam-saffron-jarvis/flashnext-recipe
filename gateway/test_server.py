@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 from aiohttp.test_utils import TestClient, TestServer
-from .server import Engine, application, resource_check, configure_reasoning
+from .server import Engine, application, resource_check, configure_reasoning, select_backend
 
 
 class GatewayTests(unittest.IsolatedAsyncioTestCase):
@@ -146,3 +146,50 @@ class ReasoningTests(unittest.TestCase):
         body = {"reasoning_effort": "medium", "max_tokens": 4096, "reasoning_budget_tokens": 99}
         configure_reasoning(body)
         self.assertEqual(body["reasoning_budget_tokens"], 99)
+
+
+class StrataBackendTests(unittest.TestCase):
+    def setUp(self):
+        select_backend("strata")
+
+    def tearDown(self):
+        select_backend("llamacpp")
+
+    def test_xhigh_maps_to_strata_high_with_large_budget(self):
+        body = {"reasoning_effort": "xhigh", "max_tokens": 16384}
+        self.assertEqual(configure_reasoning(body), "xhigh")
+        self.assertEqual(body["reasoning_effort"], "high")
+        self.assertEqual(body["reasoning_budget_tokens"], 8192)
+        self.assertNotIn("reasoning_budget_message", body)
+        self.assertNotIn("chat_template_kwargs", body)
+
+    def test_budget_still_leaves_answer_room_under_small_caps(self):
+        body = {"reasoning_effort": "medium", "max_tokens": 4096}
+        configure_reasoning(body)
+        self.assertEqual(body["reasoning_budget_tokens"], 2048)   # never 0 (uncapped on Strata)
+
+    def test_none_disables_thinking(self):
+        body = {"reasoning_effort": "none", "max_tokens": 16384}
+        configure_reasoning(body)
+        self.assertEqual(body["reasoning_effort"], "none")
+        self.assertNotIn("reasoning_budget_tokens", body)
+
+
+class StrataGatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        select_backend("strata")
+        self.engine = Engine("/nonexistent", idle=1)
+        self.client = TestClient(TestServer(application(self.engine)))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        select_backend("llamacpp")
+
+    async def test_listing_advertises_strata_limits_without_loading(self):
+        data = (await (await self.client.get("/v1/models")).json())["data"][0]
+        self.assertEqual(data["context_length"], 131072)
+        self.assertEqual(data["top_provider"]["max_completion_tokens"], 16384)
+        status = await (await self.client.get("/status")).json()
+        self.assertEqual(status["backend"], "strata")
+        self.assertIsNone(self.engine.process)

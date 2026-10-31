@@ -1,12 +1,12 @@
-# Merge this entry into providers only AFTER endpoint smoke verification.
-# Do not change default_provider or Jarvis agent defaults.
+# The live provider entry. Merge into term-llm config providers: after endpoint smoke.
+# context_window / max_output_tokens must match the engine profile you launch (128K here).
 providers:
   flashnext:
     type: openai_compatible
-    base_url: http://<appliance>:18098/v1
+    base_url: http://__HOST__:18098/v1
     model: flashnext
-    context_window: 65536
-    max_output_tokens: 4096
+    context_window: 131072
+    max_output_tokens: 16384
     models:
       - id: flashnext
         reasoning_efforts: [none, low, medium, xhigh]

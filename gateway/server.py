@@ -22,6 +22,25 @@ REASONING_BUDGETS = {"low": 512, "medium": 1024, "xhigh": 2560}
 ANSWER_RESERVE_TOKENS = 1536
 REASONING_BUDGET_MESSAGE = "\n\n(Thinking budget reached. Stop deliberating; give the answer or make the next tool call now.)\n"
 UPSTREAM = "http://127.0.0.1:18099"
+BACKEND = "llamacpp"
+STRATA_ROOT = Path("__RUNTIME_ROOT__")  # edit to your runtime root; must match --root
+# Engine profiles. llamacpp is the original UD-IQ4_XS recipe (kept for
+# rollback); strata serves ISTA-DASLab IQ3_XXS ~5x faster decode and ~9x
+# faster prefill on the same card, with 128K context.
+BACKENDS = {
+    "llamacpp": {"upstream": "http://127.0.0.1:18099", "port": 18099, "context": 65536, "max_output": 4096,
+                 "budgets": {"low": 512, "medium": 1024, "xhigh": 2560}, "reserve": 1536},
+    "strata": {"upstream": "http://127.0.0.1:18199", "port": 18199, "context": 131072, "max_output": 16384,
+               "budgets": {"low": 1024, "medium": 4096, "xhigh": 8192}, "reserve": 4096},
+}
+
+
+def select_backend(name):
+    global BACKEND, UPSTREAM, CONTEXT_WINDOW, MAX_OUTPUT_TOKENS, REASONING_BUDGETS, ANSWER_RESERVE_TOKENS
+    b = BACKENDS[name]
+    BACKEND, UPSTREAM = name, b["upstream"]
+    CONTEXT_WINDOW, MAX_OUTPUT_TOKENS = b["context"], b["max_output"]
+    REASONING_BUDGETS, ANSWER_RESERVE_TOKENS = dict(b["budgets"]), b["reserve"]
 CLIENT = web.AppKey("client", ClientSession)
 
 
@@ -76,24 +95,30 @@ class Engine:
         # Refuse *any* existing listener, not just healthy engines.
         with socket.socket() as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("127.0.0.1", 18099))
+            sock.bind(("127.0.0.1", BACKENDS[BACKEND]["port"]))
         self.lease = open("/tmp/local-llm-optional-gpu.lock", "a")
         fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         await resource_check()
-        self.log = self.root.joinpath("appliance-engine.log").open("ab")
+        if BACKEND == "strata":
+            self.log = STRATA_ROOT.joinpath("logs", "gateway-engine.log").open("ab")
+            # launch.sh keeps its own read-only GPU guard; admission above already
+            # established that the GPU is free.
+            argv, env, ready = ["bash", str(STRATA_ROOT / "launch.sh")], dict(os.environ, STRATA_GPU_CONFIRMED_FREE="1"), "/health"
+        else:
+            self.log = self.root.joinpath("appliance-engine.log").open("ab")
+            argv, env, ready = ["sh", str(Path(__file__).with_name("launch.sh"))], dict(os.environ, FLASHNEXT_ROOT=str(self.root)), "/v1/models"
         self.process = await asyncio.create_subprocess_exec(
-            "sh", str(Path(__file__).with_name("launch.sh")),
-            env=dict(os.environ, FLASHNEXT_ROOT=str(self.root)),
-            start_new_session=True, stdout=self.log, stderr=self.log)
+            *argv, env=env, start_new_session=True, stdout=self.log, stderr=self.log)
         for _ in range(300):
             if self.process.returncode is not None:
                 break
             try:
-                async with session.get(UPSTREAM + "/v1/models", timeout=ClientTimeout(total=2)) as r:
+                async with session.get(UPSTREAM + ready, timeout=ClientTimeout(total=2)) as r:
                     data = await r.json()
-                    if r.status == 200 and any(m["id"] == MODEL for m in data["data"]):
+                    if r.status == 200 and (data.get("loaded") is True if BACKEND == "strata"
+                                            else any(m["id"] == MODEL for m in data["data"])):
                         return
-            except (OSError, asyncio.TimeoutError):
+            except (OSError, asyncio.TimeoutError, ValueError, KeyError):
                 pass
             await asyncio.sleep(1)
         raise RuntimeError("engine did not load expected model")
@@ -133,17 +158,30 @@ def configure_reasoning(body):
             raise ValueError("chat_template_kwargs.reasoning_effort conflicts with reasoning_effort")
     if any(key in body for key in ("enable_thinking", "thinking", "reasoning")):
         raise ValueError("use reasoning_effort to select this endpoint's thinking mode")
-    body["reasoning_effort"] = effort
-    body["chat_template_kwargs"] = dict(kwargs, enable_thinking=enabled, reasoning_effort=effort)
+    if BACKEND == "strata":
+        # Strata's own effort ladder is none/low/medium/high; its high is the
+        # template's xhigh. It reads reasoning_budget_tokens natively and does
+        # its own wrap-up injection, so no budget message is sent.
+        body["reasoning_effort"] = "high" if effort == "xhigh" else effort
+        if kwargs:
+            body["chat_template_kwargs"] = kwargs
+    else:
+        body["reasoning_effort"] = effort
+        body["chat_template_kwargs"] = dict(kwargs, enable_thinking=enabled, reasoning_effort=effort)
     if enabled and "reasoning_budget_tokens" not in body:
         # Thinking shares max_tokens with the visible answer/tool call. Without
         # a budget, xhigh can spend the whole allowance thinking and the client
         # gets finish_reason=length with nothing usable. llama.cpp force-closes
         # the think block at the budget and injects the message first.
         limit = body.get("max_tokens", MAX_OUTPUT_TOKENS)
-        budget = min(REASONING_BUDGETS[effort], max(0, limit - ANSWER_RESERVE_TOKENS))
+        room = limit - ANSWER_RESERVE_TOKENS
+        if room < 256:
+            # Never send 0: Strata reads 0 as "uncapped", llama.cpp as "no thinking".
+            room = max(1, limit // 2)
+        budget = min(REASONING_BUDGETS[effort], room)
         body["reasoning_budget_tokens"] = budget
-        body.setdefault("reasoning_budget_message", REASONING_BUDGET_MESSAGE)
+        if BACKEND != "strata":
+            body.setdefault("reasoning_budget_message", REASONING_BUDGET_MESSAGE)
     return effort
 
 def application(engine):
@@ -153,7 +191,7 @@ def application(engine):
         return web.json_response({"object": "list", "data": [{"id": MODEL, "object": "model", "owned_by": "local-llm", "context_length": CONTEXT_WINDOW, "top_provider": {"max_completion_tokens": MAX_OUTPUT_TOKENS}, "reasoning_efforts": list(REASONING_EFFORTS), "default_reasoning_effort": DEFAULT_REASONING_EFFORT}]})
 
     async def status(request):
-        return web.json_response({"loaded": bool(engine.process and engine.process.returncode is None), "busy": engine.busy, "idle_seconds": engine.idle, "configured_context_window": CONTEXT_WINDOW})
+        return web.json_response({"loaded": bool(engine.process and engine.process.returncode is None), "busy": engine.busy, "idle_seconds": engine.idle, "configured_context_window": CONTEXT_WINDOW, "backend": BACKEND, "max_output_tokens": MAX_OUTPUT_TOKENS})
 
     async def chat(request):
         try:
@@ -228,7 +266,9 @@ if __name__ == "__main__":
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=18098)
     p.add_argument("--idle", type=int, default=120)
+    p.add_argument("--backend", choices=sorted(BACKENDS), default="llamacpp")
     args = p.parse_args()
     if args.idle < 1:
         p.error("idle must be positive")
+    select_backend(args.backend)
     web.run_app(application(Engine(args.root, args.idle)), host=args.host, port=args.port, access_log=None)

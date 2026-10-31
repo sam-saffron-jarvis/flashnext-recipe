@@ -1,0 +1,68 @@
+{
+ "schema_version": 2,
+ "id": "strata-engine",
+ "name": "strata-engine",
+ "version": "0.1.55",
+ "platform": "linux-x86_64",
+ "backend": "cuda",
+ "archs": [
+  "sm_75",
+  "sm_86",
+  "sm_89",
+  "sm_120",
+  "compute_120"
+ ],
+ "min_driver": {
+  "nvidia": "580.65"
+ },
+ "build_id": "99866a47a2b8+cuda13.0",
+ "entrypoint": "strata",
+ "files": [
+  {
+   "path": "strata",
+   "sha256": "e4406b474c292c8b52621c803f523ae18dc42c905deda60d5f055740c7ef8925",
+   "bytes": 286548608
+  },
+  {
+   "path": "BUILD.json",
+   "sha256": "0d22f2fe82d2f2e8735cc4c03bd65e81001d102b86f845f5fb639ed8dd997593",
+   "bytes": 187
+  },
+  {
+   "path": "SYSTEM-LIBS.txt",
+   "sha256": "438bf959ad70b9f3f914e561399772e5dfdd007bbbc1c7d3cefa255cf016bda4",
+   "bytes": 87
+  },
+  {
+   "path": "libcublas.so.13",
+   "sha256": "25cde432108543626df85d887c730bf2cab96803ca16f9654e4abc8d2b45833e",
+   "bytes": 54177976
+  },
+  {
+   "path": "libcublasLt.so.13",
+   "sha256": "1489aeb75d55ee55782798343ac66f57771d561cc1fe1e0491568deefa0e6515",
+   "bytes": 541607888
+  },
+  {
+   "path": "libcudart.so.13",
+   "sha256": "96c42e418cec19054186b9429c321603cc190bf26a18104e19408117a2a817b0",
+   "bytes": 704288
+  },
+  {
+   "path": "libstrata_kq.so",
+   "sha256": "7ed527222a8c3f3cd1d232007cab06897425310b820d3c0c16f31aba3cbd7665",
+   "bytes": 35881360
+  },
+  {
+   "path": "strata-vision",
+   "sha256": "b5dee7a777f75b97b68d08f8f2e41e94b195c649f0e245f743d494cfa88cbcdc",
+   "bytes": 124767240
+  }
+ ],
+ "signature": {
+  "alg": "ed25519",
+  "key_id": "5d1bc23abbeffd0d",
+  "value": "GhXUvcGM6Us5+K0KiwnLIdMQKw9aEn+F8kbm1MF9sQvGpWFoqjZrvf5Un5lCNpenrfEUxC9i5tt62J1oBCPeDw=="
+ },
+ "variant": "cuda13"
+}
