@@ -14,7 +14,7 @@ The IQ4_XS quantisation does not fit in 24 GB VRAM. llama.cpp's `--n-cpu-moe 38`
 MoE expert layers into system RAM while `-ngl 99` keeps everything else (attention, shared
 experts, KV in FP16) on the GPU. Peak VRAM measured: **21 659 MiB**.
 
-Key flags (full launcher in `launch-llamacpp.sh`):
+Key flags (full launcher in `gateway/launch-llamacpp.sh`):
 
 | flag | why |
 |---|---|
